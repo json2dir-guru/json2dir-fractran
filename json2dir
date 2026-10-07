@@ -1,0 +1,68 @@
+#!/bin/sh
+# json2dir launcher for the FRACTRAN program json2dir.fractran.
+#
+# FRACTRAN has no I/O, so this launcher is pure transport (no parsing, no decisions):
+#   in:  the document's bytes b_0..b_{n-1} become the starting number 2^E with
+#        E = 256^n + sum(b_i * 256^i), passed to the interpreter as "2^<hex>h"
+#        (a 1, then the bytes in reverse order as two hex digits each);
+#   out: the exponent of 3 in the final number is a 1 followed by one 3-digit
+#        decimal group per output byte; the groups are turned back into bytes.
+# Everything else (UTF-8 and JSON checks, validation, writing the script with its end
+# marker) happens inside the FRACTRAN program, run by an unmodified interpreter.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+export LC_ALL=C
+start=$(od -An -v -tx1 "$task_tmp/input.json" |
+  awk '{ for (i = 1; i <= NF; i++) b[n++] = $i }
+       END { printf "2^1"; for (i = n - 1; i >= 0; i--) printf "%s", b[i]; printf "h" }')
+
+if ! (
+  umask 077
+  "${JSON2DIR_FRACTRAN:-fractran}" "$script_dir/json2dir.fractran" "$start" 2 > "$task_tmp/run.txt"
+); then
+  printf '%s\n' 'json2dir: the FRACTRAN interpreter failed' >&2
+  exit 1
+fi
+
+# The final state line looks like "state:    3^1105...  * 7^2 * ..."; take the exponent of 3.
+(umask 077; awk '
+  $1 == "halted:" { halted = $2 }
+  $1 == "state:" {
+    for (i = 2; i <= NF; i++) if ($i ~ /^3(\^|$)/) { e = $i; sub(/^3\^?/, "", e); if (e == "") e = 1 }
+  }
+  END {
+    if (halted != "true") exit 1
+    for (i = 2; i <= length(e); i += 3) printf "%c", substr(e, i, 3) + 0
+  }' "$task_tmp/run.txt" > "$task_tmp/tree.sh") || {
+  printf '%s\n' 'json2dir: the evaluator did not finish' >&2
+  exit 1
+}
+
+# The script is only run if the program wrote its end marker as the last line;
+# otherwise its output is its error message.
+last=$(tail -n 1 "$task_tmp/tree.sh")
+if [ "$last" != '# json2dir: end' ]; then
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"

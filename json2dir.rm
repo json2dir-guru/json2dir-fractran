@@ -1,0 +1,621 @@
+# json2dir as a register machine; tools/fracc.py compiles it to json2dir.fractran.
+#
+# Input: IN = 256^n + sum(byte_i * 256^i), i.e. the bytes of the document as base-256
+# digits, first byte least significant, under a sentinel 1.  Output: OUT starts at 1 and
+# every output byte b makes it OUT * 1000 + b.  The program checks strict UTF-8, parses
+# and validates the JSON document and writes a POSIX sh script whose last line is
+# "# json2dir: end".  On any error the output is replaced by "json2dir: <message>".
+#
+# The script keeps the current directory in $_j2d_p and the current member name in
+# $_j2d_n, so every name is written exactly once, single-quoted, as soon as it is parsed.
+
+fixed IN 2
+fixed OUT 3
+reg R2          # the other half of IN while bytes are shifted out (base 4, alternating)
+reg B           # lookahead byte, 256 = end of input
+reg C           # decoded string byte
+reg D           # object depth
+reg SEND        # 1 when strchar met the closing quote
+reg MODE        # string kind: 1 name, 2 content, 3 link target, 4 array kind
+reg NL NONDOT   # name length (saturates at 3), name has a byte other than '.'
+reg KL KS KP K  # kind matching: "link" possible, "script" possible, position; result
+reg TLEN        # link target is not empty
+reg CP SH H     # \u escapes: code point, high surrogate bits, hex digit
+reg PB1 PB2 PB3 # pending UTF-8 bytes of an escape (byte + 1, 0 = none)
+reg NM NM2      # current member name as a base-256 number (first byte most significant)
+reg NAMES NAMES2 # names of the open objects: digits, 0 ends a name, 47 starts an object
+reg TN TN2      # names popped while looking for a duplicate
+reg X NC DG     # comparison scratch
+
+# ---- macros
+
+# DST += low byte of A (A < 1024 as base-256 digit stack) : pop one base-256 digit
+macro pop A A2 DST
+  div $A 4 $A2
+  bits $A 1 0 $DST
+  div $A2 4 $A
+  bits $A2 1 0 $DST:4
+  div $A 4 $A2
+  bits $A 1 0 $DST:16
+  div $A2 4 $A
+  bits $A2 1 0 $DST:64
+endmacro
+
+# A = A * 256 + DG, DG = 0
+macro push A
+  mul $A 256
+  bits DG 7 0 $A
+endmacro
+
+macro pushc A v
+  mul $A 256
+  inc $A $v
+endmacro
+
+macro expectb ch msg
+  switch B consume
+  case $ch
+  default
+    fail $msg
+  end
+endmacro
+
+# a UTF-8 continuation byte in lo..hi becomes pending byte P (stored + 1)
+macro cont lo hi P
+  switch B
+  case $lo..$hi
+    bits B 7 0 $P
+    inc $P 1
+    call getc
+  default
+    fail "input is not valid UTF-8"
+  end
+endmacro
+
+# ---- input
+
+# B = next input byte, or 256 at the end.  B must be 0.
+sub getc
+  if IN >= 2
+    div IN 4 R2
+    bits IN 1 0 B
+    div R2 4 IN
+    bits R2 1 0 B:4
+    div IN 4 R2
+    bits IN 1 0 B:16
+    div R2 4 IN
+    bits R2 1 0 B:64
+  else
+    inc B 256
+  end
+  ret
+end
+
+sub skipws
+skip:
+  switch B consume
+  case 9 10 13 32
+    call getc
+    goto skip
+  default
+  end
+  ret
+end
+
+# ---- output
+
+# write byte C single-quoted (C = 0); NUL closes the word so the script joins words with NUL
+sub putq
+  switch C consume
+  case 0
+    emit "' '"
+  case 39
+    emit "'\\''"
+  default
+    mul OUT 1000
+    bits C 7 0 OUT
+  end
+  ret
+end
+
+# ---- strings
+
+# H = value of the hex digit in B; reads the next byte
+sub hexdig
+  switch B
+  case '0'..'9'
+    dec B 48
+  case 'a'..'f'
+    dec B 87
+  case 'A'..'F'
+    dec B 55
+  default
+    fail "invalid \\u escape"
+  end
+  bits B 3 0 H
+  call getc
+  ret
+end
+
+sub hex4
+  call hexdig
+  bits H 3 0 CP:4096
+  call hexdig
+  bits H 3 0 CP:256
+  call hexdig
+  bits H 3 0 CP:16
+  call hexdig
+  bits H 3 0 CP
+  ret
+end
+
+# code point CP -> C and pending bytes
+sub utf8enc
+  switch CP
+  case 0..0x7f
+    bits CP 6 0 C
+  case 0x80..0x7ff
+    inc C 0xc0
+    bits CP 10 6 C
+    inc PB1 0x81
+    bits CP 5 0 PB1
+  case 0x800..0xffff
+    inc C 0xe0
+    bits CP 15 12 C
+    inc PB1 0x81
+    bits CP 11 6 PB1
+    inc PB2 0x81
+    bits CP 5 0 PB2
+  default
+    inc C 0xf0
+    bits CP 20 18 C
+    inc PB1 0x81
+    bits CP 17 12 PB1
+    inc PB2 0x81
+    bits CP 11 6 PB2
+    inc PB3 0x81
+    bits CP 5 0 PB3
+  end
+  ret
+end
+
+# B is the byte after a backslash
+sub escape
+  switch B consume
+  case '"'
+    inc C 34
+  case '\\'
+    inc C 92
+  case '/'
+    inc C 47
+  case 'b'
+    inc C 8
+  case 'f'
+    inc C 12
+  case 'n'
+    inc C 10
+  case 'r'
+    inc C 13
+  case 't'
+    inc C 9
+  case 'u'
+    call getc
+    call hex4
+    switch CP
+    case 0xdc00..0xdfff
+      fail "unpaired surrogate escape"
+    case 0xd800..0xdbff
+      dec CP 0xd800
+      bits CP 9 0 SH
+      expectb '\\' "unpaired surrogate escape"
+      call getc
+      expectb 'u' "unpaired surrogate escape"
+      call getc
+      call hex4
+      switch CP
+      case 0xdc00..0xdfff
+        dec CP 0xdc00
+        inc CP 0x10000
+        bits SH 9 0 CP:1024
+      default
+        fail "unpaired surrogate escape"
+      end
+    default
+    end
+    call utf8enc
+    ret
+  default
+    fail "invalid escape in string"
+  end
+  call getc
+  ret
+end
+
+# next decoded byte of a string body in C, or SEND = 1 after the closing quote
+sub strchar
+  if PB1 > 0
+    dec PB1 1
+    bits PB1 7 0 C
+    bits PB2 8 0 PB1
+    bits PB3 8 0 PB2
+    ret
+  end
+  switch B consume
+  case 256
+    fail "unterminated string"
+  case '"'
+    inc SEND 1
+    call getc
+  case '\\'
+    call getc
+    call escape
+  case 0..31
+    fail "control character in string"
+  case 128..193
+    fail "input is not valid UTF-8"
+  case 194..223
+    bits B 7 0 C
+    call getc
+    cont 128 191 PB1
+  case 224
+    inc C 224
+    call getc
+    cont 160 191 PB1
+    cont 128 191 PB2
+  case 225..236 238..239
+    bits B 7 0 C
+    call getc
+    cont 128 191 PB1
+    cont 128 191 PB2
+  case 237
+    inc C 237
+    call getc
+    cont 128 159 PB1
+    cont 128 191 PB2
+  case 240
+    inc C 240
+    call getc
+    cont 144 191 PB1
+    cont 128 191 PB2
+    cont 128 191 PB3
+  case 241..243
+    bits B 7 0 C
+    call getc
+    cont 128 191 PB1
+    cont 128 191 PB2
+    cont 128 191 PB3
+  case 244
+    inc C 244
+    call getc
+    cont 128 143 PB1
+    cont 128 191 PB2
+    cont 128 191 PB3
+  case 245..255
+    fail "input is not valid UTF-8"
+  default
+    bits B 7 0 C
+    call getc
+  end
+  ret
+end
+
+# kind matching: one byte C at position KP of the array's first string
+sub kindchar
+  switch KP
+  case 0
+    if C != 'l'
+      clear KL
+    end
+    if C != 's'
+      clear KS
+    end
+  case 1
+    if C != 'i'
+      clear KL
+    end
+    if C != 'c'
+      clear KS
+    end
+  case 2
+    if C != 'n'
+      clear KL
+    end
+    if C != 'r'
+      clear KS
+    end
+  case 3
+    if C != 'k'
+      clear KL
+    end
+    if C != 'i'
+      clear KS
+    end
+  case 4
+    clear KL
+    if C != 'p'
+      clear KS
+    end
+  case 5
+    clear KL
+    if C != 't'
+      clear KS
+    end
+  default
+    clear KL KS
+  end
+  inc KP 1
+  bits C 7 0
+  ret
+end
+
+# the body of a string (B is the byte after the opening quote), handled per MODE
+sub strbody
+next:
+  call strchar
+  if SEND > 0
+    dec SEND 1
+    ret
+  end
+  switch MODE
+  case 1
+    switch C
+    case 0
+      fail "a name cannot contain NUL"
+    case '/'
+      fail "a name cannot contain /"
+    case '.'
+    default
+      if NONDOT == 0
+        inc NONDOT 1
+      end
+    end
+    if NL < 3
+      inc NL 1
+    end
+    mul NM 256
+    bits C 7 0 NM X
+    bits X 7 0 C
+    call putq
+  case 2
+    call putq
+  case 3
+    if C == 0
+      fail "a link target cannot contain NUL"
+    end
+    if TLEN == 0
+      inc TLEN 1
+    end
+    call putq
+  default
+    call kindchar
+  end
+  goto next
+end
+
+# ---- duplicate names
+
+# NM is the name just parsed; fail if the current object already has it, else record it
+sub dupcheck
+scan:
+  pop NAMES NAMES2 DG
+  switch DG consume
+  case 47
+    pushc NAMES 47
+    goto restore
+  case 0
+    pushc TN 0
+    copy NM NC
+    sub2 X NC
+    if X == 0
+      if NC == 0
+        fail "duplicate member name"
+      end
+    end
+    clear X NC
+    goto scan
+  default
+    mul X 256
+    mul TN 256
+    bits DG 7 0 X TN
+    goto scan
+  end
+restore:
+  if TN > 0
+    pop TN TN2 DG
+    push NAMES
+    goto restore
+  end
+  pushc NAMES 0
+record:
+  if NM > 0
+    pop NM NM2 DG
+    push NAMES
+    goto record
+  end
+  ret
+end
+
+sub popframe
+again:
+  pop NAMES NAMES2 DG
+  switch DG consume
+  case 47
+    ret
+  default
+    bits DG 7 0
+    goto again
+  end
+end
+
+# ---- main
+
+main
+  inc IN 1        # give back the 2 taken by the start fraction
+  inc OUT 1
+  emit "set -eu\n"
+  emit "_j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n"
+  emit "# Remove an existing non-directory (a symlink itself, never its target);\n"
+  emit "# a real directory in the way of a non-object is an error.\n"
+  emit "_j2d_clear() {\n"
+  emit "  if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  emit "  elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n"
+  emit "  elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  emit "  fi\n"
+  emit "}\n"
+  emit "# $_j2d_p is the current directory, $_j2d_n the name of the current member.\n"
+  emit "_j2d_p=.\n"
+  emit "_j2d_dir() {\n"
+  emit "  _j2d_t=$_j2d_p/$_j2d_n\n"
+  emit "  if [ -L \"$_j2d_t\" ] || { [ -e \"$_j2d_t\" ] && [ ! -d \"$_j2d_t\" ]; }; then rm -f -- \"$_j2d_t\" || _j2d_fail \"$_j2d_t\"; fi\n"
+  emit "  if [ ! -d \"$_j2d_t\" ]; then mkdir -- \"$_j2d_t\" || _j2d_fail \"$_j2d_t\"; fi\n"
+  emit "  _j2d_p=$_j2d_t\n"
+  emit "}\n"
+  emit "_j2d_up() { _j2d_p=${_j2d_p%/*}; }\n"
+  emit "# _j2d_file part...: the content is the parts joined by NUL bytes.\n"
+  emit "_j2d_file() {\n"
+  emit "  _j2d_t=$_j2d_p/$_j2d_n\n"
+  emit "  _j2d_clear \"$_j2d_t\"\n"
+  emit "  {\n"
+  emit "    printf '%s' \"$1\"; shift\n"
+  emit "    for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n"
+  emit "  } > \"$_j2d_t\" || _j2d_fail \"$_j2d_t\"\n"
+  emit "}\n"
+  emit "_j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$_j2d_t\" || _j2d_fail \"$_j2d_t\"; }\n"
+  emit "_j2d_link() {\n"
+  emit "  _j2d_t=$_j2d_p/$_j2d_n\n"
+  emit "  _j2d_clear \"$_j2d_t\"\n"
+  emit "  ln -s -- \"$1\" \"$_j2d_t\" || _j2d_fail \"$_j2d_t\"\n"
+  emit "}\n"
+  call getc
+  call skipws
+  expectb '{' "the root of the document must be an object"
+  call getc
+  inc D 1
+  pushc NAMES 47
+
+objopen:
+  call skipws
+  switch B
+  case '}'
+    dec B '}'
+    goto closeobj
+  default
+  end
+
+member:
+  expectb '"' "expected a member name"
+  call getc
+  emit "_j2d_n='"
+  inc MODE 1
+  call strbody
+  dec MODE 1
+  emit "'\n"
+  if NL == 0
+    fail "a name cannot be empty"
+  end
+  if NONDOT == 0
+    if NL < 3
+      fail "a name cannot be . or .."
+    end
+  end
+  bits NL 1 0
+  clear NONDOT
+  call dupcheck
+  call skipws
+  expectb ':' "expected :"
+  call getc
+  call skipws
+  switch B consume
+  case '{'
+    emit "_j2d_dir\n"
+    call getc
+    inc D 1
+    pushc NAMES 47
+    goto objopen
+  case '"'
+    emit "_j2d_file '"
+    call getc
+    inc MODE 2
+    call strbody
+    dec MODE 2
+    emit "'\n"
+  case '['
+    call getc
+    call skipws
+    expectb '"' "an array must be [link, target] or [script, content]"
+    call getc
+    inc MODE 4
+    inc KL 1
+    inc KS 1
+    call strbody
+    dec MODE 4
+    if KL > 0
+      if KP == 4
+        inc K 1
+      end
+    end
+    if KS > 0
+      if KP == 6
+        inc K 2
+      end
+    end
+    clear KL KS KP
+    if K == 0
+      fail "an array must be [link, target] or [script, content]"
+    end
+    call skipws
+    expectb ',' "an array must be [link, target] or [script, content]"
+    call getc
+    call skipws
+    expectb '"' "an array must be [link, target] or [script, content]"
+    call getc
+    if K == 1
+      emit "_j2d_link '"
+      inc MODE 3
+      call strbody
+      dec MODE 3
+      if TLEN == 0
+        fail "a link target cannot be empty"
+      end
+      dec TLEN 1
+    else
+      emit "_j2d_script '"
+      inc MODE 2
+      call strbody
+      dec MODE 2
+    end
+    clear K
+    emit "'\n"
+    call skipws
+    expectb ']' "an array must be [link, target] or [script, content]"
+    call getc
+  default
+    fail "only objects, strings and [kind, payload] arrays are allowed"
+  end
+
+aftervalue:
+  call skipws
+  switch B consume
+  case ','
+    call getc
+    call skipws
+    goto member
+  case '}'
+  default
+    fail "expected , or }"
+  end
+
+closeobj:
+  call getc
+  call popframe
+  dec D 1
+  if D > 0
+    emit "_j2d_up\n"
+    goto aftervalue
+  end
+  call skipws
+  expectb 256 "trailing data after the JSON value"
+  emit "# json2dir: end\n"
+  clear IN
+  halt
+end
